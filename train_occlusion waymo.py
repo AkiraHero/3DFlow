@@ -18,9 +18,24 @@ from main_utils import *
 from models_occlusion_kitti import ThreeDFlow_Kitti, multiScaleLoss
 
 
+#for distributed
+import torch.distributed as dist
+import torch.optim as optim
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+def setup(rank, world_size):
+    # os.environ['MASTER_ADDR'] = 'localhost'
+    # os.environ['MASTER_PORT'] = '12355'
+    # initialize the process group
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+def cleanup():
+    dist.destroy_process_group()
 
 
-def main():
+
+def main(distributed=False, rank=0):
 
     if "NUMBA_DISABLE_JIT" in os.environ:
         del os.environ["NUMBA_DISABLE_JIT"]
@@ -81,13 +96,19 @@ def main():
         # full=args.full,
     )
     logger.info("train_dataset: " + str(train_dataset))
+    train_sampler = None
+    if distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
+
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=False if distributed else True,
         num_workers=args.workers,
         pin_memory=True,
         worker_init_fn=lambda x: np.random.seed((torch.initial_seed()) % (2 ** 32)),
+        sampler=train_sampler,
     )
 
     val_dataset = datasets.__dict__[args.dataset](
@@ -106,16 +127,21 @@ def main():
         num_workers=args.workers,
         pin_memory=True,
         worker_init_fn=lambda x: np.random.seed((torch.initial_seed()) % (2 ** 32)),
+        sampler=val_sampler,
     )
 
     """GPU selection and multi-GPU"""
-    if args.multi_gpu is not None:
-        device_ids = [int(x) for x in args.multi_gpu.split(",")]
-        torch.backends.cudnn.benchmark = True
-        model.cuda(device_ids[0])
-        model = torch.nn.DataParallel(model, device_ids=device_ids)
-    else:
-        model.cuda()
+    # if args.multi_gpu is not None:
+    #     device_ids = [int(x) for x in args.multi_gpu.split(",")]
+    #     torch.backends.cudnn.benchmark = True
+    #     model.cuda(device_ids[0])
+    #     model = torch.nn.DataParallel(model, device_ids=device_ids)
+    # else:
+    #     model.cuda()
+        
+    if distributed:
+        model.to(rank)
+        model = DDP(model, device_ids=[rank])
 
     if args.pretrain is not None:
         """
@@ -204,41 +230,43 @@ def main():
         scheduler.step()
 
         train_loss = total_loss / total_seen
-        str_out = "EPOCH %d %s mean loss: %f" % (epoch, blue("train"), train_loss)
-        print(str_out)
-        logger.info(str_out)
+        if rank == 0:
+            str_out = "EPOCH %d %s mean loss: %f" % (epoch, blue("train"), train_loss)
+            print(str_out)
+            logger.info(str_out)
 
         eval_epe3d, eval_loss = eval_sceneflow(model.eval(), val_loader)
-        str_out = "EPOCH %d %s mean epe3d: %f  mean eval loss: %f" % (
-            epoch,
-            blue("eval"),
-            eval_epe3d,
-            eval_loss,
-        )
-        print(str_out)
-        logger.info(str_out)
+        if rank == 0:
+            str_out = "EPOCH %d %s mean epe3d: %f  mean eval loss: %f" % (
+                epoch,
+                blue("eval"),
+                eval_epe3d,
+                eval_loss,
+            )
+            print(str_out)
+            logger.info(str_out)
 
-        if eval_epe3d < best_epe:
-            best_epe = eval_epe3d
-            if args.multi_gpu is not None:
-                torch.save(
-                    model.module.state_dict(),
-                    "%s/%s_%.3d_%.4f.pth"
-                    % (checkpoints_dir, args.model_name, epoch, best_epe),
-                )
-            else:
-                torch.save(
-                    model.state_dict(),
-                    "%s/%s_%.3d_%.4f.pth"
-                    % (checkpoints_dir, args.model_name, epoch, best_epe),
-                )
-            logger.info("Save model ...")
-            print("Save model ...")
-        print("Best epe loss is: %.5f" % (best_epe))
-        logger.info("Best epe loss is: %.5f" % (best_epe))
+            if eval_epe3d < best_epe:
+                best_epe = eval_epe3d
+                if args.multi_gpu is not None:
+                    torch.save(
+                        model.module.state_dict(),
+                        "%s/%s_%.3d_%.4f.pth"
+                        % (checkpoints_dir, args.model_name, epoch, best_epe),
+                    )
+                else:
+                    torch.save(
+                        model.state_dict(),
+                        "%s/%s_%.3d_%.4f.pth"
+                        % (checkpoints_dir, args.model_name, epoch, best_epe),
+                    )
+                logger.info("Save model ...")
+                print("Save model ...")
+            print("Best epe loss is: %.5f" % (best_epe))
+            logger.info("Best epe loss is: %.5f" % (best_epe))
 
 
-def eval_sceneflow(model, loader):
+def eval_sceneflow(model, loader, distributed=False, ngpus=1, rank=0):
 
     metrics = defaultdict(lambda: list())
     for batch_id, data in tqdm(enumerate(loader), total=len(loader), smoothing=0.9):
@@ -251,13 +279,26 @@ def eval_sceneflow(model, loader):
         flow = flow.cuda().float()
         mask = mask.unsqueeze(2).cuda().float()
 
-        with torch.no_grad():
+        with torch.no_grad() and rank == 0:
             pred_flows, gt_flows, pc1, pc2, _, _, _mask = model(
                 pos1, pos2, norm1, norm2, flow, mask
             )
+            if distributed:
+                pred_flows_gather_list = [torch.zeros_like(pred_flows) for _ in range(ngpus)]
+                torch.distributed.all_gather(pred_flows_gather_list, pred_flows)
+                
+                gt_flows_gather_list = [torch.zeros_like(gt_flows) for _ in range(ngpus)]
+                torch.distributed.all_gather(gt_flows_gather_list, gt_flows)
+                
+                mask_gather_list = [torch.zeros_like(_mask) for _ in range(ngpus)]
+                torch.distributed.all_gather(mask_gather_list, _mask)
+                # cat
+                pred_flows_gather_list = torch.cat(pred_flows_gather_list)
+                gt_flows_gather_list = torch.cat(gt_flows_gather_list)
+                mask_gather_list = torch.cat(mask_gather_list)
+                pred_flows, gt_flows, _mask = pred_flows_gather_list, gt_flows_gather_list, mask_gather_list
 
             eval_loss = multiScaleLoss(pred_flows, gt_flows, _mask)
-
             mask_sum = torch.sum(_mask[0], 1)  # B 1
             error = torch.norm(
                 pred_flows[0].permute(0, 2, 1) - gt_flows[0].permute(0, 2, 1),
@@ -269,11 +310,12 @@ def eval_sceneflow(model, loader):
             )
             epe3d = torch.mean(epe3d)
 
-        metrics["epe3d_loss"].append(epe3d.cpu().data.numpy())
-        metrics["eval_loss"].append(eval_loss.cpu().data.numpy())
+            metrics["epe3d_loss"].append(epe3d.cpu().data.numpy())
+            metrics["eval_loss"].append(eval_loss.cpu().data.numpy())
 
-    mean_epe3d = np.mean(metrics["epe3d_loss"])
-    mean_eval = np.mean(metrics["eval_loss"])
+    if rank==0:
+        mean_epe3d = np.mean(metrics["epe3d_loss"])
+        mean_eval = np.mean(metrics["eval_loss"])
 
     return mean_epe3d, mean_eval
 

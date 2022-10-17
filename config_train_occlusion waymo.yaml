@@ -26,7 +26,7 @@ DEVICE: cuda
 evaluate: False
 
 dataset: WaymoDataset 
-data_root: /home/xlju/data/waymo_sf_processed/train
+data_root: /home/xlju/data/waymo_sf_processed/
 
 data_process:
   DEPTH_THRESHOLD: 35.

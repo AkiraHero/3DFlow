@@ -65,6 +65,10 @@ class WaymoDataset(data.Dataset):
         self.remove_ground = remove_ground
 
         # Config parameters
+        if train:
+            data_root = data_root + '/train'
+        else:
+            data_root = data_root + '/valid'
         metadata_path = os.path.join(data_root, 'metadata')
         # It has information regarding the files and transformations
 
